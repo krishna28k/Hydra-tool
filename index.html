@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Cyber Terminal v1.0</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; width:100%; }
+  body {
+    background:#000;
+    color:#00ff41;
+    font-family:'Courier New', Courier, monospace;
+    font-size:13px;
+    height:100%;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:flex-start;
+    padding:6px;
+    overflow:hidden;
+  }
+  #terminal {
+    width:100%;
+    max-width:700px;
+    background:#000;
+    border:2px solid #00ff41;
+    box-shadow:0 0 18px #00ff41aa, 0 0 40px #00ff4133;
+    padding:12px 14px;
+    height:98vh;
+    display:flex;
+    flex-direction:column;
+  }
+  .scanline {
+    pointer-events:none;
+    position:fixed; top:0; left:0;
+    width:100%; height:100%;
+    background:repeating-linear-gradient(
+      to bottom,
+      transparent 0px, transparent 3px,
+      rgba(0,0,0,0.08) 3px, rgba(0,0,0,0.08) 4px
+    );
+    z-index:999;
+  }
+  #out {
+    flex:1;
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+    margin-bottom:6px;
+    scroll-behavior:smooth;
+  }
+  #out::-webkit-scrollbar { width:3px; }
+  #out::-webkit-scrollbar-thumb { background:#00ff4155; }
+  .line {
+    margin:2px 0;
+    white-space:pre-wrap;
+    word-break:break-all;
+    line-height:1.55;
+    font-size:clamp(11px, 2.8vw, 14px);
+  }
+  .cyan   { color:#00ffff; }
+  .yellow { color:#ffe600; }
+  .red    { color:#ff3c3c; }
+  .green  { color:#00ff41; }
+  .dim    { color:#007a20; }
+  .bold   { font-weight:bold; }
+
+  #input-row {
+    display:flex;
+    align-items:center;
+    border-top:1px solid #00ff4166;
+    padding-top:6px;
+    gap:5px;
+    flex-shrink:0;
+  }
+  #input-prompt {
+    color:#00ffff;
+    white-space:nowrap;
+    font-size:clamp(11px, 2.8vw, 14px);
+  }
+  #cmd-input {
+    flex:1;
+    background:#000;
+    color:#00ff41;
+    border:none;
+    outline:none;
+    font-family:'Courier New', Courier, monospace;
+    font-size:clamp(11px, 2.8vw, 14px);
+    caret-color:#00ff41;
+    min-width:0;
+    /* prevent iOS zoom on focus */
+    font-size:16px;
+  }
+  /* fix iOS zoom: keep display size small via transform */
+  @media (max-width: 600px) {
+    #cmd-input { font-size:16px; }
+    .line { font-size:12px; }
+    #input-prompt { font-size:12px; }
+  }
+
+  #timer-bar {
+    display:none;
+    background:#001a00;
+    border:1px solid #00ff41;
+    padding:4px 8px;
+    margin-bottom:5px;
+    font-size:clamp(10px,2.5vw,12px);
+    color:#00ffff;
+    text-align:center;
+    letter-spacing:1px;
+    flex-shrink:0;
+    word-break:break-all;
+  }
+
+  .bar-row {
+    display:flex;
+    align-items:center;
+    gap:4px;
+    margin:2px 0;
+    flex-wrap:wrap;
+  }
+  .bar-outer {
+    flex:1;
+    min-width:80px;
+    max-width:180px;
+    background:#001a00;
+    border:1px solid #00ff41;
+    height:12px;
+  }
+  .bar-pct { width:32px; text-align:right; color:#00ff41; font-size:11px; }
+  .bar-ok  { color:#00ffff; margin-left:3px; font-size:11px; }
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+<div id="terminal">
+  <div id="timer-bar">⏱ Remaining: --:--</div>
+  <div id="out"></div>
+  <div id="input-row">
+    <span id="input-prompt">root@cyber:~$&nbsp;</span>
+    <input id="cmd-input" type="text" autocomplete="off" autocorrect="off"
+           autocapitalize="off" spellcheck="false" placeholder="Type and press Enter..." />
+  </div>
+</div>
+
+<script>
+const out      = document.getElementById('out');
+const inp      = document.getElementById('cmd-input');
+const timerBar = document.getElementById('timer-bar');
+const inpRow   = document.getElementById('input-row');
+
+inp.focus();
+document.body.addEventListener('click', ()=>inp.focus());
+document.body.addEventListener('touchend', ()=>{ inp.focus(); }, {passive:true});
+
+// Mobile keyboard open hone par scroll fix
+inp.addEventListener('focus', ()=>{
+  setTimeout(()=>{ scroll(); }, 400);
+});
+
+const s = ms => new Promise(r => setTimeout(r, ms));
+let running = false;
+let timerInterval = null;
+let busy = false;
+
+// ── Helpers ──
+function scroll(){ out.scrollTop = out.scrollHeight; }
+
+function add(html, cls=''){
+  const d = document.createElement('div');
+  d.className = 'line ' + cls;
+  d.innerHTML = html;
+  out.appendChild(d);
+  scroll();
+  return d;
+}
+
+async function type(text, cls='', delay=90){
+  const d = document.createElement('div');
+  d.className = 'line ' + cls;
+  out.appendChild(d);
+  for(let c of text){ d.textContent += c; scroll(); await s(delay); }
+}
+
+async function bar(label, steps=22, dt=200, red=false){
+  const uid = Math.random().toString(36).slice(2,8);
+  const bc = red ? '#ff3c3c' : '#00ff41';
+  const lc = red ? '#ff3c3c' : '#00ffff';
+  const row = document.createElement('div');
+  row.className = 'bar-row';
+  row.innerHTML = `<span style="min-width:170px;color:${lc}">${label}</span>
+    <div class="bar-outer"><div id="bi${uid}" style="height:100%;background:${bc};box-shadow:0 0 5px ${bc};width:0%"></div></div>
+    <span class="bar-pct" id="bp${uid}">0%</span>
+    <span class="bar-ok" id="bk${uid}"></span>`;
+  out.appendChild(row);
+  const bi=document.getElementById('bi'+uid);
+  const bp=document.getElementById('bp'+uid);
+  const bk=document.getElementById('bk'+uid);
+  for(let i=1;i<=steps;i++){
+    bi.style.width=(i/steps*100)+'%';
+    bp.textContent=Math.round(i/steps*100)+'%';
+    scroll(); await s(dt);
+  }
+  bk.textContent='✓'; bk.style.color='#00ffff';
+}
+
+function rnd(a,b){ return Math.floor(Math.random()*(b-a+1))+a; }
+function rIP(){ return `${rnd(10,199)}.${rnd(0,255)}.${rnd(0,255)}.${rnd(1,254)}`; }
+function rMAC(){ return Array.from({length:6},()=>('0'+rnd(0,255).toString(16).toUpperCase()).slice(-2)).join(':'); }
+function rHex(){ let h=''; for(let i=0;i<16;i++) h+=('0'+rnd(0,255).toString(16).toUpperCase()).slice(-2)+' '; return h; }
+const MC='アイウエオABCDEF0123456789@#$%&*';
+function mLine(){ let h=''; for(let i=0;i<52;i++) h+=MC[rnd(0,MC.length-1)]; return h; }
+
+function trimLines(){
+  const lines = out.querySelectorAll('.line,.bar-row');
+  if(lines.length > 160) for(let i=0;i<lines.length-120;i++) lines[i].remove();
+}
+
+// ── Timer ──
+function startTimer(label, minutes=30){
+  const endTime = Date.now() + minutes*60*1000;
+  timerBar.style.display='block';
+  timerBar.style.color='#00ffff';
+  timerInterval = setInterval(()=>{
+    const rem=Math.max(0,endTime-Date.now());
+    const m=String(Math.floor(rem/60000)).padStart(2,'0');
+    const sc=String(Math.floor((rem%60000)/1000)).padStart(2,'0');
+    timerBar.textContent=`⏱ ${label}  |  Remaining: ${m}:${sc}`;
+    if(rem===0){ clearInterval(timerInterval); running=false; }
+  },1000);
+  return endTime;
+}
+function stopTimer(){
+  clearInterval(timerInterval);
+  setTimeout(()=>{ timerBar.style.display='none'; },2000);
+}
+
+// ── waitForInput ──
+// allowed = null (any input) or array of allowed values
+// maskMode = true for password masking
+function waitForInput(allowed=null, maskMode=false){
+  return new Promise(resolve => {
+    const d = document.createElement('div');
+    d.className = 'line dim';
+    d.textContent = '  > ';
+    out.appendChild(d); scroll();
+
+    // temporarily disable main handler
+    inp.setAttribute('data-waiting','1');
+
+    function onKey(e){
+      if(e.key !== 'Enter') return;
+      const val = inp.value.trim();
+      inp.value = '';
+      if(allowed && !allowed.includes(val.toLowerCase())){
+        add(`<span class="red">  Invalid. Type: ${allowed.join(' / ')}</span>`);
+        return;
+      }
+      inp.removeEventListener('keydown', onKey);
+      inp.removeEventListener('input', onInp);
+      d.remove();
+      inp.removeAttribute('data-waiting');
+      resolve(val);
+    }
+    function onInp(){
+      const v = inp.value;
+      d.textContent = maskMode ? '  > ' + '•'.repeat(v.length) : '  > ' + v;
+      scroll();
+    }
+    inp.addEventListener('keydown', onKey);
+    inp.addEventListener('input', onInp);
+  });
+}
+
+// ── Menu ──
+function showMenu(){
+  add('');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('<span class="cyan bold">          █ CYBER TERMINAL v1.0 █</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  add('<span class="cyan">[1]  Hydra Dongle</span>');
+  add('<span class="cyan">[2]  THC Hydra Cyber Security</span>');
+  add('<span class="cyan">[3]  Disconnect Device</span>');
+  add('<span class="cyan">[4]  Device Remove</span>');
+  add('<span class="red">[0]  Exit</span>');
+  add('');
+  add('<span class="dim">Type a number and press Enter...</span>');
+}
+
+// ── Main input handler ──
+inp.addEventListener('keydown', async (e)=>{
+  if(e.key !== 'Enter') return;
+  if(inp.getAttribute('data-waiting')) return; // waitForInput is active
+  const val = inp.value.trim();
+  inp.value = '';
+  if(!val) return;
+
+  const cmd = val.toLowerCase();
+
+  if(cmd === 'stop' || cmd === '0'){
+    add(`<span class="yellow">▶ ${val}</span>`);
+    if(busy){
+      running = false;
+      stopTimer();
+      add('<span class="red bold">[ STOPPED ]</span>');
+      await s(800);
+      busy = false;
+      showMenu();
+    } else {
+      await exitTerminal();
+    }
+    return;
+  }
+
+  if(cmd === 'start'){
+    add(`<span class="yellow">▶ ${val}</span>`);
+    if(busy){ running=false; stopTimer(); busy=false; }
+    await s(300);
+    showMenu();
+    return;
+  }
+
+  add(`<span class="yellow">▶ ${val}</span>`);
+  if(busy) return;
+
+  if(val==='1'){ busy=true; await option1(); busy=false; showMenu(); }
+  else if(val==='2'){ busy=true; await option2(); busy=false; showMenu(); }
+  else if(val==='3'){ busy=true; await option3(); busy=false; showMenu(); }
+  else if(val==='4'){ busy=true; await option4(); busy=false; showMenu(); }
+  else { add(`<span class="red">Invalid command.</span>`); }
+});
+
+// ══════════════════════════════════════
+// COMMON PHASES
+// ══════════════════════════════════════
+async function phaseInit(label){
+  await type(`Initializing ${label}...`,'cyan',90);
+  await bar('Init Modules',rnd(18,26),rnd(180,240));
+}
+async function phaseUSBScan(){
+  await type('Scanning USB Ports...','cyan',90);
+  await s(800);
+  for(let i=1;i<=4;i++){
+    const found=(i===rnd(2,4));
+    add(`<span class="dim">  USB Port ${i}: ${found?'<span style="color:#00ff41">DEVICE FOUND</span>':'No device'}</span>`);
+    await s(700);
+  }
+}
+async function phaseDriverCheck(){
+  await type('Checking Drivers...','cyan',90);
+  await bar('Driver Verification',rnd(16,22),rnd(180,230));
+  add(`<span class="green">  ✓ Driver OK — Serial: HD-${rnd(1000,9999)}-XXXX</span>`);
+}
+async function phaseConnect(){
+  await type('Connecting...','cyan',90);
+  await bar('Establishing Connection',rnd(18,26),rnd(180,220));
+  add(`<span class="green">  ✓ Connected — Token: 0x${rnd(1000,65535).toString(16).toUpperCase()}</span>`);
+}
+async function phaseDataStream(){
+  await type('Reading Data Stream...','cyan',90);
+  await s(700);
+  for(let i=0;i<rnd(5,9);i++){
+    add(`<span class="dim">  DATA[${String(i).padStart(3,'0')}]: ${rHex()}</span>`);
+    await s(500);
+  }
+}
+async function phaseNetworkProbe(){
+  await type('Probing Network Nodes...','cyan',90);
+  await s(700);
+  for(let i=0;i<rnd(4,7);i++){
+    const open=rnd(0,1);
+    add(`<span class="dim">  ${rIP()}:${rnd(20,9999)} — ${open?'<span style="color:#00ff41">OPEN</span>':'<span style="color:#ff3c3c">CLOSED</span>'}</span>`);
+    await s(600);
+  }
+}
+async function phaseMatrixRain(){
+  await type('Signal Trace Active...','cyan',90);
+  await s(700);
+  for(let i=0;i<rnd(7,12);i++){
+    const op=(0.3+Math.random()*0.7).toFixed(2);
+    add(`<span style="color:#00ff41;opacity:${op}">${mLine()}</span>`);
+    await s(280);
+  }
+}
+async function phaseReconnect(){
+  await type('Re-Authenticating...','yellow',90);
+  await bar('Re-Authentication',rnd(16,22),rnd(180,230));
+  add(`<span class="green">  ✓ Token: 0x${rnd(1000,9999).toString(16).toUpperCase()} Refreshed</span>`);
+}
+async function phasePacketAnalysis(){
+  await type('Analyzing Packets...','cyan',90);
+  await bar('Packet Analysis',rnd(18,26),rnd(180,220));
+  add(`<span class="dim">  Scanned: ${rnd(100,9999)} pkts — Flagged: ${rnd(0,4)}</span>`);
+}
+async function phaseEncryption(){
+  await type('Encrypting Channel...','cyan',90);
+  await bar('AES-256 Encryption',rnd(20,28),rnd(175,215));
+  add('<span class="green">  ✓ Secure tunnel established</span>');
+}
+async function phasePortScan(){
+  await type('Running Port Scan...','cyan',90);
+  await s(700);
+  const ports=[22,80,443,8080,3306,3389,21,25];
+  for(let p of ports){
+    const st=rnd(0,2);
+    const col=st===0?'#00ff41':st===1?'#ffe600':'#ff3c3c';
+    const label=st===0?'OPEN':st===1?'FILTERED':'CLOSED';
+    add(`<span class="dim">  Port <span style="color:#00ffff">${String(p).padEnd(6,' ')}</span> <span style="color:${col}">${label}</span></span>`);
+    await s(500);
+  }
+}
+async function phaseAuthCheck(){
+  await type('Auth Verification...','cyan',90);
+  await s(700);
+  for(let i=1;i<=4;i++){
+    const ok=i===4;
+    add(`<span class="${ok?'green':'dim'}">  Check ${i}: ${ok?'<span style="color:#00ff41">✓ VERIFIED</span>':'○ Processing...'}</span>`);
+    await s(800);
+  }
+}
+
+const allPhases = [
+  ()=>phaseInit('System'), phaseUSBScan, phaseDriverCheck, phaseConnect,
+  phaseDataStream, phaseNetworkProbe, phaseMatrixRain,
+  phaseReconnect, phasePacketAnalysis, phaseEncryption,
+  phasePortScan, phaseAuthCheck
+];
+
+async function runCycles(endTime, extraFn=null){
+  let cycle=0;
+  while(running && Date.now()<endTime){
+    cycle++;
+    add('');
+    add(`<span class="dim">── Cycle ${cycle} ──────────────────────────────────</span>`);
+    await s(1200);
+    if(extraFn){ const done=await extraFn(cycle,endTime); if(done) break; }
+    if(!running) break;
+    const shuffled=[...allPhases].sort(()=>Math.random()-0.5);
+    const count=rnd(3,5);
+    for(let i=0;i<count;i++){
+      if(!running||Date.now()>=endTime) break;
+      await shuffled[i]();
+      await s(rnd(1500,2500));
+    }
+    trimLines();
+    await s(rnd(1500,2500));
+  }
+}
+
+// ══════════════════════════════════════
+// OPTION 1 — Hydra Dongle (18 min)
+// ══════════════════════════════════════
+async function option1(){
+  running=true;
+  const endTime=startTimer('Option 1 — Hydra Dongle', 18);
+  add('<span class="yellow bold">▶ Option 1 — Hydra Dongle [RUN]</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  await s(600);
+  await runCycles(endTime);
+  stopTimer();
+  add('');
+  add('<span class="green bold">✓ Option 1 — Session Complete [RUN]</span>');
+  add('<span class="dim">(do not clike screen)</span>');
+  await s(800);
+}
+
+// ══════════════════════════════════════
+// OPTION 2 — THC Hydra (30 min, yes/no at 12 min)
+// ══════════════════════════════════════
+async function option2(){
+  running=true;
+  const endTime=startTimer('Option 2 — THC Hydra', 30);
+  add('<span class="yellow bold">▶ Option 2 — THC Hydra Cyber Security [RUN]</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  await s(600);
+
+  const startTime=Date.now();
+  let promptDone=false;
+
+  await runCycles(endTime, async (cycle, et)=>{
+    const elapsed=Date.now()-startTime;
+    if(!promptDone && elapsed >= 12*60*1000){
+      promptDone=true;
+      await s(500);
+      add('');
+      add('<span class="yellow bold">╔══════════════════════════════════════════════╗</span>');
+      add('<span class="yellow bold">║      ⚠  ACCESS CONFIRMATION REQUIRED        ║</span>');
+      add('<span class="yellow bold">╚══════════════════════════════════════════════╝</span>');
+      add('');
+      await type('Target credentials found in database.','cyan',70);
+      await type('Do you want to proceed with full access?','yellow',70);
+      add('');
+      add('<span class="green">  [ yes ]  — Proceed with full access</span>');
+      add('<span class="red">  [ no  ]  — Abort operation</span>');
+      add('');
+
+      const answer = await waitForInput(['yes','no'], false);
+      add('');
+      if(answer==='yes'){
+        add('<span class="yellow">▶ yes</span>');
+        await type('Access granted. Proceeding...','green',70);
+        await bar('Full Access Initiated',24,180);
+        await s(500);
+        await type('Extracting credentials...','cyan',70);
+        for(let i=0;i<6;i++){
+          add(`<span class="dim">  CRED[${i}]: ${'*'.repeat(rnd(8,16))} — CAPTURED</span>`);
+          await s(400);
+        }
+        await type('Bypassing security layers...','cyan',70);
+        await bar('Security Bypass',22,175);
+        await s(500);
+        add('<span class="green bold">✓ Full Access Established</span>');
+      } else {
+        add('<span class="yellow">▶ no</span>');
+        await type('Operation aborted by user.','red',70);
+        await bar('Aborting',16,160,true);
+        await s(400);
+        add('<span class="red bold">✗ Operation Cancelled.</span>');
+        await s(800);
+        running=false;
+        return true;
+      }
+      await s(1000);
+    }
+    return false;
+  });
+
+  stopTimer();
+  add('');
+  add('<span class="green bold">✓ Option 2 — Session Complete [RUN]</span>');
+  add('<span class="dim">(do not clike screen)</span>');
+  await s(800);
+}
+
+// ══════════════════════════════════════
+// OPTION 3 — Disconnect Device (30 min)
+// 3 fails at 6,13,20 min → success at 26 min
+// ══════════════════════════════════════
+async function option3(){
+  running=true;
+  const endTime=startTimer('Option 3 — Disconnect Device', 30);
+  add('<span class="yellow bold">▶ Option 3 — Disconnect Device [RUN]</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  await s(600);
+
+  const svcs=['Instagram','Facebook','WhatsApp','Telegram','Snapchat','X (Twitter)','Discord'];
+  const failTimes=[6*60*1000, 13*60*1000, 20*60*1000, 26*60*1000];
+  const startTime=Date.now();
+  let attemptIdx=0;
+
+  await runCycles(endTime, async (cycle, et)=>{
+    const elapsed=Date.now()-startTime;
+    if(attemptIdx<=3 && elapsed>=failTimes[attemptIdx]){
+      if(attemptIdx<3){
+        await s(500);
+        add('');
+        add('<span class="cyan bold">════ DISCONNECT ATTEMPT ════</span>');
+        await type('Scanning Available Services...','cyan',90);
+        await s(800);
+        for(let sv of svcs){ add(`<span class="cyan">  • ${sv}</span>`); await s(350); }
+        await s(800);
+        await type('Initiating Disconnect...','red',90);
+        await bar('Connecting to Network',rnd(18,26),rnd(180,230),true);
+        await s(1000);
+        add('');
+        add('<span class="red bold">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>');
+        add('<span class="red bold">  ⚠  Current Location: Internet Traffic Area</span>');
+        add('<span class="red bold">  ✗  This location is not working.</span>');
+        add('<span class="yellow">     Try another location.</span>');
+        add('<span class="red">  ✗  No Internet Traffic detected.</span>');
+        add('<span class="red bold">━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>');
+        await s(2000);
+        attemptIdx++;
+      } else {
+        await s(500);
+        add('');
+        add('<span class="cyan bold">════ FINAL DISCONNECT ATTEMPT ════</span>');
+        await type('Scanning Available Services...','cyan',90);
+        await s(800);
+        for(let sv of svcs){ add(`<span class="cyan">  • ${sv}</span>`); await s(350); }
+        await s(800);
+        await type('Initiating Disconnect Sequence...','red',90);
+        await s(800);
+        for(let sv of svcs){
+          const uid='s3'+sv.replace(/[\s()]/g,'');
+          const row=document.createElement('div');
+          row.className='bar-row line';
+          row.innerHTML=`<span style="min-width:140px;color:#ff3c3c">${sv}</span>
+            <div class="bar-outer" style="max-width:150px">
+              <div id="${uid}" style="height:100%;background:#ff3c3c;box-shadow:0 0 5px #ff3c3c;width:0%"></div>
+            </div>
+            <span class="bar-ok" id="ok${uid}"></span>`;
+          out.appendChild(row); scroll();
+          const si=document.getElementById(uid);
+          const sk=document.getElementById('ok'+uid);
+          for(let j=1;j<=20;j++){ si.style.width=(j/20*100)+'%'; scroll(); await s(130); }
+          sk.textContent='✓ Done'; sk.style.color='#00ff41';
+          await s(250);
+        }
+        await s(600);
+        add('');
+        add('<span class="green bold">████████████████████████████████████████████</span>');
+        add('<span class="green bold">  ✓  SUCCESS</span>');
+        add('<span class="green bold">  ✓  DEVICE DISCONNECTED</span>');
+        add('<span class="green bold">  ✓  DEVICE REMOVED</span>');
+        add('<span class="green bold">████████████████████████████████████████████</span>');
+        await s(1500);
+        running=false;
+        return true;
+      }
+    }
+    return false;
+  });
+
+  stopTimer();
+  if(attemptIdx<4){
+    add('');
+    add('<span class="green bold">✓ Option 3 — Session Complete [RUN]</span>');
+    add('<span class="dim">(do not clike screen)</span>');
+  }
+  await s(800);
+}
+
+// ══════════════════════════════════════
+// OPTION 4 — Social Media/Calls/Photos (30 min)
+// ══════════════════════════════════════
+async function option4(){
+  running=true;
+  const endTime=startTimer('Option 4 — Device Remove', 30);
+  add('<span class="yellow bold">▶ Option 4 — Device Remove [RUN]</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  await s(600);
+
+  const fakeUsers=[
+    'user_4821','device_77','unknown_xyz','guest_009','node_332',
+    'client_55','alpha_19','beta_042','target_88','unit_217',
+    'user_7749','anon_331','sys_099','device_404','client_81'
+  ];
+  const socials=['Instagram','Facebook','WhatsApp','Telegram','Snapchat','X (Twitter)','Discord'];
+  const fixedEnds=['9783','4440','8241','0137','3641','1606','6506','1359','4977','3638','0248','4970','5841','0230'];
+
+  function buildPhoneList(){
+    const list=fixedEnds.map(e=>{
+      const p1=rnd(6,9);
+      const p2=String(rnd(10000,99999));
+      return { num:`+91 ${p1}${p2.slice(0,2)}**** ${e}`, fixed:true };
+    });
+    for(let i=0;i<9;i++){
+      const r1=rnd(6,9);
+      const r2=String(rnd(10000,99999));
+      const r3=String(rnd(1000,9999));
+      list.push({ num:`+91 ${r1}${r2.slice(0,2)}**** ${r3}`, fixed:false });
+    }
+    return list.sort(()=>Math.random()-0.5);
+  }
+
+  const startTime=Date.now();
+  const milestones=[8*60*1000, 16*60*1000, 24*60*1000];
+  let mDone=[false,false,false];
+
+  await runCycles(endTime, async (cycle, et)=>{
+    const elapsed=Date.now()-startTime;
+
+    // ~8 min: Login/Logout + Phone numbers
+    if(!mDone[0] && elapsed>=milestones[0]){
+      mDone[0]=true;
+      add('');
+      add('<span class="cyan bold">════ LOGIN / LOGOUT ACTIVITY LOG ════</span>');
+      await s(600);
+      for(let i=0;i<8;i++){
+        const u=fakeUsers[rnd(0,fakeUsers.length-1)];
+        const action=rnd(0,1)?'LOGIN ':'LOGOUT';
+        const col=action==='LOGIN '?'#00ff41':'#ff3c3c';
+        const hr=String(rnd(0,23)).padStart(2,'0');
+        const mn=String(rnd(0,59)).padStart(2,'0');
+        const sc2=String(rnd(0,59)).padStart(2,'0');
+        add(`<span class="dim">  [${hr}:${mn}:${sc2}] <span style="color:${col}">${action}</span>  user: <span style="color:#ffe600">${u}</span>  ip: ${rIP()}</span>`);
+        await s(500);
+      }
+      await s(700);
+      add('');
+      add('<span class="cyan bold">════ LINKED MOBILE NUMBERS ════</span>');
+      await type('Scanning registered devices...','cyan',70);
+      await s(600);
+      const phones=buildPhoneList();
+      add('<span class="dim">  ┌──────────────────────────────────────────────┐</span>');
+      add('<span class="dim">  │  #    Mobile Number             Status        │</span>');
+      add('<span class="dim">  ├──────────────────────────────────────────────┤</span>');
+      for(let i=0;i<phones.length;i++){
+        const p=phones[i];
+        const idx=String(i+1).padStart(2,' ');
+        const numPad=p.num.padEnd(24,' ');
+        const badge=p.fixed
+          ? '<span style="color:#ff3c3c">⚠ Aadhar Device</span>'
+          : '<span style="color:#ffe600">Unknown      </span>';
+        add(`<span class="dim">  │ ${idx}. <span style="color:#00ffff">${numPad}</span> ${badge} │</span>`);
+        await s(300);
+      }
+      add('<span class="dim">  └──────────────────────────────────────────────┘</span>');
+      await s(600);
+      await type('Removing linked numbers...','red',70);
+      await s(400);
+      for(let i=0;i<phones.length;i++){
+        const p=phones[i];
+        const idx=String(i+1).padStart(2,' ');
+        add(`<span class="dim">  [${idx}/${phones.length}] <span style="color:#ff3c3c">REMOVED</span>  <span style="color:#00ffff">${p.num}</span>${p.fixed?' — <span style="color:#ff3c3c">Aadhar Device</span>':''}</span>`);
+        await s(rnd(250,400));
+      }
+      await s(500);
+      add('<span class="green bold">✓ All linked numbers removed.</span>');
+      await s(800);
+    }
+
+    // ~16 min: Social media + call recordings
+    if(!mDone[1] && elapsed>=milestones[1]){
+      mDone[1]=true;
+      add('');
+      add('<span class="cyan bold">════ SOCIAL MEDIA ACCOUNTS ════</span>');
+      await type('Scanning linked accounts...','cyan',70);
+      await s(500);
+      for(let sv of socials){ add(`<span class="cyan">  • ${sv}</span>`); await s(250); }
+      await s(500);
+      await type('Removing social media links...','red',70);
+      await s(400);
+      for(let sv of socials){
+        const uid='sm'+sv.replace(/[\s()]/g,'');
+        const row=document.createElement('div');
+        row.className='bar-row line';
+        row.innerHTML=`<span style="min-width:140px;color:#ff3c3c">${sv}</span>
+          <div class="bar-outer" style="max-width:150px">
+            <div id="${uid}" style="height:100%;background:#ff3c3c;box-shadow:0 0 5px #ff3c3c;width:0%"></div>
+          </div>
+          <span class="bar-ok" id="ok${uid}"></span>`;
+        out.appendChild(row); scroll();
+        const si=document.getElementById(uid);
+        const sk=document.getElementById('ok'+uid);
+        for(let j=1;j<=20;j++){ si.style.width=(j/20*100)+'%'; scroll(); await s(120); }
+        sk.textContent='✓ Removed'; sk.style.color='#00ff41';
+        await s(200);
+      }
+      add('');
+      add('<span class="green bold">✓ All social media links removed.</span>');
+      await s(800);
+      add('');
+      add('<span class="cyan bold">════ CALL RECORDINGS ════</span>');
+      await type('Scanning call logs...','cyan',70);
+      await s(500);
+      const callCount=rnd(8,18);
+      for(let i=1;i<=callCount;i++){
+        const dur=`${rnd(0,59)}:${String(rnd(0,59)).padStart(2,'0')}`;
+        add(`<span class="dim">  CALL_REC_${String(i).padStart(3,'0')}.mp3  [${dur}]  — <span style="color:#ff3c3c">DELETING...</span></span>`);
+        await s(350);
+      }
+      await bar('Call Recordings Deleted',22,160,true);
+      add(`<span class="green">  ✓ ${callCount} call recordings deleted.</span>`);
+      await s(800);
+    }
+
+    // ~24 min: Photos 1-85 deleted
+    if(!mDone[2] && elapsed>=milestones[2]){
+      mDone[2]=true;
+      add('');
+      add('<span class="cyan bold">════ PHOTO / IMAGE STORAGE ════</span>');
+      await type('Scanning image database...','cyan',70);
+      await bar('Image Scan',20,150);
+      await s(500);
+      add(`<span class="cyan">  Total images found: <span style="color:#ffe600">85</span></span>`);
+      await s(400);
+      await type('Deleting images...','red',70);
+      await s(400);
+      for(let i=1;i<=85;i++){
+        const ext=['jpg','png','jpeg','mp4','gif'][rnd(0,4)];
+        const nm=`IMG_${String(i).padStart(4,'0')}_${rnd(1000,9999)}.${ext}`;
+        add(`<span class="dim">  [${String(i).padStart(2,' ')}/85] <span style="color:#ff3c3c">DELETED</span>  ${nm}</span>`);
+        await s(rnd(180,320));
+        trimLines();
+      }
+      await s(600);
+      add('<span class="green bold">✓ All 85 images/files deleted.</span>');
+      await s(800);
+    }
+    return false;
+  });
+
+  stopTimer();
+  add('');
+  add('<span class="green bold">✓ Option 4 — Session Complete [RUN]</span>');
+  add('<span class="dim">(do not clike screen)</span>');
+  await s(800);
+}
+
+// ══════════════════════════════════════
+// EXIT
+// ══════════════════════════════════════
+async function exitTerminal(){
+  add('');
+  await type('Terminating session...','red',45);
+  await bar('Shutdown',20,80,true);
+  await s(400);
+  add('<span class="red bold">[ TERMINAL CLOSED ]</span>');
+  add('<span class="dim">Press F5 to reload.</span>');
+  inpRow.style.display='none';
+}
+
+// ══════════════════════════════════════
+// LOGIN SCREEN
+// ══════════════════════════════════════
+async function showLogin(){
+  add('');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('<span class="cyan bold">           ■  AUTHENTICATION REQUIRED  ■</span>');
+  add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+  add('');
+  await type('Enter credentials to access terminal.','dim',40);
+  add('');
+
+  // Username
+  add('<span class="cyan">Username:</span>');
+  const uname = await waitForInput(null, false);
+
+  if(uname.toLowerCase() !== 'nouser'){
+    add(`<span class="yellow">▶ ${uname}</span>`);
+    await type('[ ACCESS DENIED ] — Invalid username.','red',50);
+    await s(800);
+    await type('Restarting authentication...','dim',40);
+    await s(1000);
+    out.innerHTML='';
+    await showLogin();
+    return;
+  }
+
+  add(`<span class="yellow">▶ ${uname}</span>`);
+  await type('Username accepted.','green',40);
+  await s(400);
+
+  // Password
+  add('');
+  add('<span class="cyan">Password:</span>');
+  const pwd = await waitForInput(null, true);
+
+  if(pwd === 'Hyderabad'){
+    add('<span class="yellow">▶ ••••••••••••</span>');
+    add('');
+    add('<span class="green bold">════════════════════════════════════════════════</span>');
+    add('<span class="green bold">  ✓  AUTHENTICATION SUCCESSFUL</span>');
+    add('<span class="green bold">════════════════════════════════════════════════</span>');
+    await s(500);
+    add('');
+    await type('Running device security check...','cyan',50);
+    await bar('Security Scan',24,140);
+    await s(400);
+    add('');
+    add('<span class="green bold">  ✓  DEVICE STATUS : SAFE</span>');
+    add('<span class="green">  ✓  All systems clear</span>');
+    add('<span class="green">  ✓  No threats detected</span>');
+    add('<span class="green">  ✓  Device not connected to any foreign network</span>');
+    add('<span class="green">  ✓  No unknown functions running</span>');
+    add('<span class="green">  ✓  No foreign devices linked</span>');
+    add('<span class="green">  ✓  Device is secured and verified</span>');
+    add('');
+    add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+    add('<span class="cyan bold">  ■  SAFE MODE — All Clear. Device is secure.</span>');
+    add('<span class="cyan bold">  ■  No login saved. Device verified.</span>');
+    add('<span class="cyan bold">════════════════════════════════════════════════</span>');
+    await s(800);
+    // No menu — terminal stops here, input hidden
+    inpRow.style.display='none';
+
+  } else if(pwd === 'Hyderabad##'){
+    add('<span class="yellow">▶ ••••••••••</span>');
+    add('');
+    add('<span class="green bold">  ✓  AUTHENTICATION SUCCESSFUL</span>');
+    await s(500);
+    await type('Loading terminal...','cyan',50);
+    await s(600);
+    showMenu();
+
+  } else {
+    add('<span class="yellow">▶ ••••••••</span>');
+    await type('[ ACCESS DENIED ] — Incorrect password.','red',50);
+    await s(800);
+    await type('Restarting authentication...','dim',40);
+    await s(1000);
+    out.innerHTML='';
+    await showLogin();
+  }
+}
+
+// ══════════════════════════════════════
+// BOOT
+// ══════════════════════════════════════
+async function boot(){
+  busy=true;
+  await type('Booting Cyber Terminal v1.0...','cyan',42);
+  await bar('System Boot',20,85);
+  await s(500);
+  await showLogin();
+  busy=false;
+}
+boot();
+</script>
+</body>
+</html>
